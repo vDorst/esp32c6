@@ -1,32 +1,22 @@
 #![no_std]
 #![no_main]
 
-use embassy_sync::signal::Signal;
 use esp_backtrace as _;
-
-use esp_hal::i2c::I2C;
-use esp_hal::peripherals::I2C0;
-use esp_hal::Async;
 use esp_println::{self as _};
 
 use esp_println::println;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Ticker, Timer};
-
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, RawMutex};
-
+use embassy_net::{tcp::TcpSocket, Stack, StackResources};
+use embassy_time::{Duration, Timer};
 use esp_hal::{
     clock::ClockControl,
-    gpio::{Input, Io, Pull},
+    gpio::Io,
     peripherals::Peripherals,
-    prelude::*,
-    rmt::Rmt,
     rng::Rng,
     system::SystemControl,
     timer::{timg::TimerGroup, ErasedTimer, OneShotTimer},
 };
-
 use esp_wifi::{
     initialize,
     wifi::{
@@ -35,66 +25,32 @@ use esp_wifi::{
     },
     EspWifiInitFor,
 };
-
-use embassy_net::{tcp::TcpSocket, Stack, StackResources};
-
-use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
 use log::error;
-use smart_leds::{SmartLedsWrite, RGB8};
 use static_cell::StaticCell;
 
 static STATIC_CELL: StaticCell<[OneShotTimer<ErasedTimer>; 1]> = StaticCell::new();
-
-const LEDNUM: usize = 1;
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 
 const TCP_LISTEN_PORT: u16 = 9000;
 
-use sht3x::SHT3x;
+const RX_BUFFER: usize = 1500;
+const TX_BUFFER: usize = 1500;
+const RECV_BUFFER: usize = 300;
+const TASK_BUFFER: usize = RX_BUFFER + TX_BUFFER + RECV_BUFFER;
 
-struct TempData {
-    t: sht3x::Tmp,
-    h: sht3x::Hum,
-}
-
-type TempSignal = Signal<CriticalSectionRawMutex, TempData>;
-
-static TEMPDATA: TempSignal = TempSignal::new();
-
-#[embassy_executor::task]
-async fn tempdata_handle(mut i2c1: I2C<'static, I2C0, Async>) {
-    let mut sht = SHT3x::new(&mut i2c1);
-
-    let _ = sht.reset().await;
-    let mut tick = Ticker::every(Duration::from_hz(1));
-    Timer::after(Duration::from_millis(10)).await;
-
-    while sht.write(sht3x::CMD::AUTO_1MPS_HIGH).await.is_err() {
-        tick.next().await;
-    }
-
-    loop {
-        tick.next().await;
-        match sht.get_measurement().await {
-            Ok((t, h)) => {
-                let temp: i16 = t.into();
-                let hum: u8 = h.into();
-                println!("t: {:?} h {:?}", temp, hum);
-                TEMPDATA.signal(TempData { t, h });
-            }
-            Err(e) => {
-                println!("TEMP: I2C error: {:?}", e);
-            }
-        }
-    }
-}
+/// Number TCP connections to handle
+const TASKS: usize = 8;
 
 type NetStack = Stack<WifiDevice<'static, WifiStaDevice>>;
 
-static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+/// Network Resources.
+/// Need to specify the number of sockets we want to use.
+/// N_TASKS + 1 DHCP Client.
+static RESOURCES: StaticCell<StackResources<{ 1 + TASKS }>> = StaticCell::new();
 static STACK: StaticCell<NetStack> = StaticCell::new();
+static NETWORKBUFFER: StaticCell<[u8; TASK_BUFFER * TASKS]> = StaticCell::new();
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -111,7 +67,7 @@ async fn main(spawner: Spawner) {
 
     let timers = STATIC_CELL.init(timers);
 
-    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
+    let _io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
 
     let init = initialize(
         EspWifiInitFor::Wifi,
@@ -121,14 +77,6 @@ async fn main(spawner: Spawner) {
         &clocks,
     )
     .unwrap();
-
-    let i2c0 = I2C::new_async(
-        peripherals.I2C0,
-        io.pins.gpio11,
-        io.pins.gpio10,
-        400.kHz(),
-        &clocks,
-    );
 
     let wifi = peripherals.WIFI;
     let (wifi_interface, controller) =
@@ -143,44 +91,35 @@ async fn main(spawner: Spawner) {
     let stack = STACK.init(Stack::new(
         wifi_interface,
         config,
-        RESOURCES.init(StackResources::<3>::new()),
+        RESOURCES.init(StackResources::new()),
         seed,
     ));
 
-    // spawner.must_spawn(tempdata_handle(i2c0));
+    let net_buffer = NETWORKBUFFER.init([0; TASKS * TASK_BUFFER]);
 
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(stack)).ok();
 
-    let knopje = Input::new(io.pins.gpio9, Pull::Up);
-
-    let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
-    let rmt_buffer = smartLedBuffer!(1);
-    let mut led = SmartLedsAdapter::new(rmt.channel0, io.pins.gpio8, rmt_buffer, &clocks);
-
-    let mut data = [RGB8::default(); LEDNUM];
-
+    println!("Waiting for link up...");
     loop {
         if stack.is_link_up() {
             break;
         }
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 
     println!("Waiting to get IP address...");
-    let local_addr = loop {
+    let _local_addr = loop {
         if let Some(config) = stack.config_v4() {
             println!("Got IP: {}", config.address);
             break config.address.address();
         }
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(100)).await;
     };
 
-    println!("Init2!");
-
-    for idx in 0..4 {
+    for (idx, buf) in net_buffer.chunks_exact_mut(TASK_BUFFER).enumerate() {
         println!("Spawn TcpThreads: {}", idx);
-        if let Err(e) = spawner.spawn(handle_tcp_connection(stack, idx)) {
+        if let Err(e) = spawner.spawn(handle_tcp_connection(stack, buf, idx)) {
             error!("Failed to spawn thread id {}, {:?}", idx, e);
         }
     }
@@ -189,56 +128,19 @@ async fn main(spawner: Spawner) {
         Timer::after_secs(10).await;
         println!("Main thread: Still alive");
     }
-    //     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    //     socket.set_timeout(Some(Duration::from_secs(2)));
-
-    //     println!("Listening on tcp://{}:{}...", local_addr, TCP_LISTEN_PORT);
-    //     if let Err(e) = socket.accept(TCP_LISTEN_PORT).await {
-    //         error!("accept error: {:?}", e);
-    //         continue;
-    //     }
-
-    //     if let Some(remote_ip) = socket.remote_endpoint() {
-    //         println!("Connection from: {}", remote_ip);
-    //     } else {
-    //         println!("Connection...");
-    //     }
-    //     loop {
-    //         let n = match socket.read(&mut sock_buf).await {
-    //             Ok(0) => {
-    //                 println!("read EOF");
-    //                 break;
-    //             }
-    //             Ok(n) => n,
-    //             Err(e) => {
-    //                 println!("Error: {:?}", e);
-    //                 break;
-    //             }
-    //         };
-
-    //         println!("Got: {:02x?}", &sock_buf[0..n]);
-
-    //         let col = match sock_buf[0] {
-    //             b'r' => RGB8::new(0x00, 0x00, 0x80),
-    //             b'g' => RGB8::new(0x00, 0x80, 0x00),
-    //             b'b' => RGB8::new(0x80, 0x00, 0x00),
-    //             _ => RGB8::new(0x1, 0x1, 0x1),
-    //         };
-    //         data[0] = col;
-    //         led.write(data.iter().cloned()).unwrap();
-    //     }
-    // }
 }
 
-#[embassy_executor::task]
-async fn handle_tcp_connection(stack: &'static NetStack, idx: usize) -> ! {
-    let mut rx_buffer = [0; 1500];
-    let mut tx_buffer = [0; 300];
-
-    let mut sock_buf = [0; 1500];
+#[embassy_executor::task(pool_size = TASKS)]
+async fn handle_tcp_connection(
+    stack: &'static NetStack,
+    buffer: &'static mut [u8],
+    idx: usize,
+) -> ! {
+    let (sock_buf, buffer) = buffer.split_at_mut(RECV_BUFFER);
+    let (rx_buffer, tx_buffer) = buffer.split_at_mut(RX_BUFFER);
 
     loop {
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        let mut socket = TcpSocket::new(stack, rx_buffer, tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
         println!("[{}]: Listening on tcp://:{}...", idx, TCP_LISTEN_PORT);
@@ -253,7 +155,7 @@ async fn handle_tcp_connection(stack: &'static NetStack, idx: usize) -> ! {
             println!("[{}]: Connection...", idx);
         }
         loop {
-            let n = match socket.read(&mut sock_buf).await {
+            let n = match socket.read(sock_buf).await {
                 Ok(0) => {
                     println!("[{}]: read EOF", idx);
                     break;

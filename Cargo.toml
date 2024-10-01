@@ -12,7 +12,6 @@ esp-hal = {version = "0.20.1", features = ["esp32c6"]}
 esp-hal-embassy = { version = "0.3.0", features = ["esp32c6", "integrated-timers"] }
 esp-wifi = {version = "0.9.1", features = ["esp32c6", "wifi", "embassy-net", "log"] }
 esp-backtrace = { version = "0.14.1", features = ["exception-handler", "panic-handler",  "esp32c6", "println"] }
-esp-hal-smartled = { version = "0.13.0", features = [ "esp32c6"]}
 embassy-sync = { version = "0.6.0", features = ["defmt"] }
 
 # defmt = { version = "0.3.8" }
@@ -23,16 +22,12 @@ embassy-time        = "0.3.2"
 embedded-hal-1     = { version = "1.0.0", package = "embedded-hal" }
 embedded-hal-async = "1.0.0"
 
-smart-leds = "0.4.0"
-
 log = "0.4.22"
 
 static_cell         = { version = "2.1.0" }
 
 embassy-net = { version = "0.4.0", features = [ "tcp", "dhcpv4", "medium-ethernet"] }
-smoltcp             = { version = "0.11.0", default-features = false, features = [ "medium-ethernet", "socket-raw"] }
-
-sht3x = { path = "../sht3x" }
+smoltcp = { version = "0.11.0", default-features = false, features = [ "medium-ethernet", "socket-raw"] }
 
 [profile.release]
 codegen-units    = 1
